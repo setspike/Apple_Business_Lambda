@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Look up an Apple Business device by serial number via the Apple Business API.
+
+Parameters:
+  SecretId:
+    Type: String
+    Description: >-
+      Name (not ARN) of the Secrets Manager secret holding client_id, key_id and
+      private_key_pem, e.g. abm/api-credentials.
+    AllowedPattern: '^[A-Za-z0-9/_+=.@-]+$'
+    MinLength: 1
+  AbmScope:
+    Type: String
+    Description: OAuth scope. business.api for Apple Business, school.api for Apple School Manager.
+    Default: business.api
+    AllowedValues: [business.api, school.api]
+  AbmApiBaseUrl:
+    Type: String
+    Description: API base URL. Use https://api-school.apple.com for Apple School Manager.
+    Default: https://api-business.apple.com
+    AllowedPattern: '^https://[A-Za-z0-9.-]+$'
+
+Resources:
+  DeviceLookupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          ABM_SECRET_ID: !Ref SecretId
+          ABM_SCOPE: !Ref AbmScope
+          ABM_API_BASE_URL: !Ref AbmApiBaseUrl
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              # Secrets Manager appends a 6-character suffix to secret ARNs.
+              Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretId}-??????'
+
+  DeviceLookupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DeviceLookupFunction}'
+      RetentionInDays: 30
+
+Outputs:
+  FunctionUrl:
+    Description: Function URL (requires SigV4-signed requests).
+    Value: !GetAtt DeviceLookupFunctionUrl.FunctionUrl
+  FunctionName:
+    Value: !Ref DeviceLookupFunction
