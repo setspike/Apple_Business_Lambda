@@ -20,16 +20,31 @@ Parameters:
     Description: API base URL. Use https://api-school.apple.com for Apple School Manager.
     Default: https://api-business.apple.com
     AllowedPattern: '^https://[A-Za-z0-9.-]+$'
-  FunctionUrlAuthType:
+  AuthMode:
     Type: String
     Description: >-
-      AWS_IAM requires SigV4-signed requests. NONE makes the URL public (anyone with
-      the URL can query your organization's devices); use it only for short-lived testing.
-    Default: AWS_IAM
-    AllowedValues: [AWS_IAM, NONE]
+      How Function URL callers authenticate. BearerToken (default, used by Nexthink):
+      callers send "Authorization: Bearer <token>" matching the token secret.
+      AwsIam: callers sign requests with AWS SigV4 and need IAM invoke permission.
+    Default: BearerToken
+    AllowedValues: [BearerToken, AwsIam]
+  AuthTokenSecretId:
+    Type: String
+    Description: >-
+      Name (not ARN) of the Secrets Manager secret holding the caller bearer token as
+      {"token": "..."}, e.g. abm/nexthink-bearer-token. Required when AuthMode is BearerToken.
+    Default: ''
+    AllowedPattern: '^[A-Za-z0-9/_+=.@-]*$'
+
+Rules:
+  BearerTokenNeedsSecret:
+    RuleCondition: !Equals [!Ref AuthMode, BearerToken]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AuthTokenSecretId, '']]
+        AssertDescription: AuthTokenSecretId is required when AuthMode is BearerToken.
 
 Conditions:
-  PublicUrl: !Equals [!Ref FunctionUrlAuthType, NONE]
+  UseBearerToken: !Equals [!Ref AuthMode, BearerToken]
 
 Resources:
   DeviceLookupFunction:
@@ -46,19 +61,29 @@ Resources:
           ABM_SECRET_ID: !Ref SecretId
           ABM_SCOPE: !Ref AbmScope
           ABM_API_BASE_URL: !Ref AbmApiBaseUrl
+          # Empty disables the token check (AwsIam mode).
+          AUTH_TOKEN_SECRET_ID: !If [UseBearerToken, !Ref AuthTokenSecretId, '']
       FunctionUrlConfig:
-        AuthType: !Ref FunctionUrlAuthType
+        # BearerToken mode: the URL is reachable without AWS signing, and the
+        # function itself rejects any request without a valid token (401).
+        AuthType: !If [UseBearerToken, NONE, AWS_IAM]
       Policies:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               # Secrets Manager appends a 6-character suffix to secret ARNs.
-              Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretId}-??????'
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretId}-??????'
+                - !If
+                  - UseBearerToken
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AuthTokenSecretId}-??????'
+                  - !Ref AWS::NoValue
 
-  # A public (NONE) Function URL needs both of these resource-based permissions.
+  # A Function URL without AWS signing (BearerToken mode) needs both of these
+  # resource-based permissions.
   PublicUrlInvokeUrlPermission:
     Type: AWS::Lambda::Permission
-    Condition: PublicUrl
+    Condition: UseBearerToken
     Properties:
       FunctionName: !Ref DeviceLookupFunction
       Action: lambda:InvokeFunctionUrl
@@ -67,7 +92,7 @@ Resources:
 
   PublicUrlInvokePermission:
     Type: AWS::Lambda::Permission
-    Condition: PublicUrl
+    Condition: UseBearerToken
     Properties:
       FunctionName: !Ref DeviceLookupFunction
       Action: lambda:InvokeFunction
@@ -82,7 +107,7 @@ Resources:
 
 Outputs:
   FunctionUrl:
-    Description: Function URL (requires SigV4-signed requests).
+    Description: Function URL. Callers need a bearer token (BearerToken mode) or SigV4 signing (AwsIam mode).
     Value: !GetAtt DeviceLookupFunctionUrl.FunctionUrl
   FunctionName:
     Value: !Ref DeviceLookupFunction

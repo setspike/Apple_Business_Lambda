@@ -8,6 +8,28 @@ variable "secret_name" {
   }
 }
 
+variable "auth_mode" {
+  description = "How Function URL callers authenticate. bearer_token (default, used by Nexthink): callers send \"Authorization: Bearer <token>\" matching the token secret. aws_iam: callers sign requests with AWS SigV4."
+  type        = string
+  default     = "bearer_token"
+
+  validation {
+    condition     = contains(["bearer_token", "aws_iam"], var.auth_mode)
+    error_message = "auth_mode must be bearer_token or aws_iam."
+  }
+}
+
+variable "auth_token_secret_name" {
+  description = "Name (not ARN) of an EXISTING Secrets Manager secret holding the caller bearer token as {\"token\": \"...\"}. Required when auth_mode is bearer_token; see terraform/README.md."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.auth_token_secret_name == null || (can(regex("^[A-Za-z0-9/_+=.@-]+$", var.auth_token_secret_name)) && !startswith(coalesce(var.auth_token_secret_name, "x"), "arn:"))
+    error_message = "auth_token_secret_name must be a secret name such as abm/nexthink-bearer-token, not an ARN."
+  }
+}
+
 variable "function_name" {
   description = "Name of the Lambda function. Also used to name the IAM role and log group."
   type        = string
@@ -42,13 +64,13 @@ variable "api_base_url" {
 }
 
 variable "enable_function_url" {
-  description = "Create a Lambda Function URL. It always uses AWS_IAM auth (SigV4-signed requests); this module never creates a public URL. Set false to allow only direct invokes (for example through a Lambda VPC endpoint)."
+  description = "Create a Lambda Function URL. Required for bearer_token mode. In aws_iam mode, set false to allow only direct invokes (for example through a Lambda VPC endpoint)."
   type        = bool
   default     = true
 }
 
 variable "invoker_principals" {
-  description = "AWS account IDs or IAM role/user ARNs, typically in OTHER accounts, allowed to call the function. Callers in this account only need an identity policy (see the invoke_policy_json output)."
+  description = "AWS account IDs or IAM role/user ARNs, typically in OTHER accounts, allowed to call the function with AWS credentials (the Function URL in aws_iam mode, or direct invokes). Callers in this account only need an identity policy (see the invoke_policy_json output)."
   type        = list(string)
   default     = []
 

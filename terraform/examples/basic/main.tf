@@ -37,6 +37,11 @@ variable "secret_name" {
   type        = string
 }
 
+variable "auth_token_secret_name" {
+  description = "Name of the existing Secrets Manager secret with the caller bearer token."
+  type        = string
+}
+
 variable "kms_key_arn" {
   description = "Customer-managed KMS key ARN that encrypts the secret (recommended), or null."
   type        = string
@@ -44,7 +49,7 @@ variable "kms_key_arn" {
 }
 
 variable "invoker_principals" {
-  description = "Other AWS accounts or roles allowed to call the function."
+  description = "Other AWS accounts or roles allowed to invoke the function directly with AWS credentials."
   type        = list(string)
   default     = []
 }
@@ -54,7 +59,12 @@ module "abm_device_lookup" {
   # source = "git::https://<your-git-host>/ab_lambda.git//terraform?ref=<tag>"
   source = "../.."
 
-  secret_name        = var.secret_name
+  secret_name = var.secret_name
+
+  # Callers (Nexthink) authenticate with "Authorization: Bearer <token>".
+  auth_mode              = "bearer_token"
+  auth_token_secret_name = var.auth_token_secret_name
+
   kms_key_arn        = var.kms_key_arn
   invoker_principals = var.invoker_principals
 

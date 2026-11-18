@@ -5,94 +5,103 @@ A small AWS Lambda function that looks up a device in **Apple Business** (former
 Its purpose is to back a **[Nexthink API call](https://docs.nexthink.com/configuring_nexthink/bringing-data-into-your-nexthink-instance/integrating-nexthink-with-third-party-tools/api-calls) triggered from Nexthink Workspaces**, so support staff can see a device's Apple Business record while working on it. See [Using it from Nexthink Workspaces](#using-it-from-nexthink-workspaces).
 
 - Node.js 22.x, ES modules, **no runtime npm dependencies** (built-in `crypto` and `fetch`; the AWS SDK v3 that ships with the Lambda runtime).
-- Exposed through a **Lambda Function URL with `AWS_IAM` auth**, so every caller must sign requests with SigV4.
-- The Apple private key lives **only in AWS Secrets Manager**.
-- Deploy with **AWS SAM** (this page) or **Terraform**: see [terraform/README.md](terraform/README.md) for a step-by-step guide, including how to keep the Apple key safe.
+- Exposed through a **Lambda Function URL protected by a bearer token**: every request must send `Authorization: Bearer <token>`, or it is rejected with 401 before anything else happens.
+- The Apple private key and the bearer token live **only in AWS Secrets Manager**.
+- Deploy with **AWS SAM** (this page) or **Terraform**: see [terraform/README.md](terraform/README.md) for a step-by-step guide, including how to keep the Apple key and the token safe.
 
 ## What it does
 
 ```
 GET <function-url>/?serial=C02XXXXXXXXX
 GET <function-url>/?serial=C02XXXXXXXXX&include=assignedServer,appleCareCoverage
+Authorization: Bearer <token>
 ```
 
-or a direct invoke with `{"serial": "C02XXXXXXXXX", "include": ["assignedServer"]}`.
+or a direct invoke with `{"serial": "C02XXXXXXXXX", "include": ["assignedServer"]}` (direct invokes need the IAM permission `lambda:InvokeFunction` instead of the token).
 
 | Result | Status | Body |
 | --- | --- | --- |
 | Device found | 200 | Apple's JSON from `GET /v1/orgDevices/{serial}`, plus `assignedServer` / `appleCareCoverage` keys when requested (a related resource Apple reports as 404 is `null`) |
+| Missing or wrong bearer token | 401 | `{"error":"Unauthorized"}` (nothing else is checked or called) |
 | Device not in your organization | 404 | `{"error":"Device not found"}` |
-| Serial not 8–14 uppercase alphanumeric, or unknown `include` value | 400 | error message (no network call is made) |
+| Serial not 8–14 uppercase alphanumeric, or unknown `include` value | 400 | error message (no call to Apple is made) |
 | Non-GET Function URL request | 405 | error message |
 | Secrets Manager, token or Apple API failure | 502 | `{"error":"Upstream request failed"}` |
 
-Each request writes one log line containing only the request id, the serial, and the upstream HTTP status.
+Each request writes one log line containing only the request id, the serial, and the upstream HTTP status (or `"auth": "rejected"` for a refused token).
 
 ## Architecture
 
 ```
-caller ──SigV4──▶ Function URL (AWS_IAM) ──▶ Lambda
-                                               │ 1. GetSecretValue (cached per container)
-                                               ├──────────────▶ Secrets Manager
-                                               │ 2. ES256 client-assertion JWT, POST /auth/oauth2/token
-                                               ├──────────────▶ account.apple.com   (token cached until ~60 s before expiry)
-                                               │ 3. GET /v1/orgDevices/{serial}[/assignedServer|/appleCareCoverage]
-                                               └──────────────▶ api-business.apple.com
+caller ──HTTPS + Bearer token──▶ Function URL ──▶ Lambda
+                                                   │ 0. check the bearer token (token secret re-read every 5 min)
+                                                   │ 1. GetSecretValue for the Apple key (cached per container)
+                                                   ├──────────────▶ Secrets Manager
+                                                   │ 2. ES256 client-assertion JWT, POST /auth/oauth2/token
+                                                   ├──────────────▶ account.apple.com   (token cached until ~60 s before expiry)
+                                                   │ 3. GET /v1/orgDevices/{serial}[/assignedServer|/appleCareCoverage]
+                                                   └──────────────▶ api-business.apple.com
 ```
 
 | File | Purpose |
 | --- | --- |
-| `src/index.mjs` | Handler: input validation, response mapping, logging |
+| `src/index.mjs` | Handler: bearer token check, input validation, response mapping, logging |
 | `src/abm.mjs` | Client assertion JWT, OAuth token (with cache), API calls, 401 retry |
-| `src/secret.mjs` | Secrets Manager access (with cache) |
+| `src/secret.mjs` | Secrets Manager access (with caches) |
 | `template.yaml` | AWS SAM template |
+| `terraform/` | Terraform module, example and step-by-step guide |
 | `test/` | `node:test` suite with mocked `fetch` and a throwaway EC key generated at test time |
 
-On a `401` from the API the cached token is dropped and the call retried once.
+On a `401` from Apple's API the cached Apple token is dropped and the call retried once.
 
 ## Prerequisites
 
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- AWS CLI with credentials for the target account
+- AWS CLI v2 with credentials for the target account, plus `jq` and `openssl`
 - Node.js 22+ (for running tests locally)
 - Administrator access to Apple Business (Organization Administrator role)
 
 ## 1. Create the Apple API account and key
 
 1. Sign in to [Apple Business](https://business.apple.com) as an Organization Administrator.
-2. Go to **Settings > API** and create an API account. Apple generates a private key; download the `.pem` file immediately and store it somewhere safe outside this repository.
-3. Note the **Client ID** (looks like `BUSINESSAPI.00000000-0000-0000-0000-000000000000`) and the **Key ID** shown for the account.
+2. Go to **Settings > API** and create an API account. Download the private key (`.pem`) when it is offered, to a local folder that isn't synced to the cloud.
+3. Note the **Client ID** (looks like `BUSINESSAPI.00000000-0000-0000-0000-000000000000`) and the **Key ID**. They are different values; putting the Client ID in the Key ID field makes Apple reject every token request with 400.
 
 For Apple School Manager the client ID starts with `SCHOOLAPI.`; use scope `school.api` and API base URL `https://api-school.apple.com` when deploying.
 
-## 2. Store the credentials in Secrets Manager
+## 2. Store the Apple credentials in Secrets Manager
 
-Build the secret JSON from the downloaded key in a working directory **outside this repo** (or rely on `.gitignore`, which already excludes `*.pem` and `abm-secret.json`). Every value below is a placeholder:
+This reads the `.pem` file and pipes it straight into Secrets Manager, so no intermediate file is written and the key never appears on screen. Every value is a placeholder:
 
 ```bash
-jq -n \
-  --arg client_id "BUSINESSAPI.00000000-0000-0000-0000-000000000000" \
-  --arg key_id    "00000000-0000-0000-0000-000000000000" \
-  --rawfile private_key_pem ./your-downloaded-key.pem \
-  '{client_id: $client_id, key_id: $key_id, private_key_pem: $private_key_pem}' > abm-secret.json
+jq -n --arg client_id "BUSINESSAPI.00000000-0000-0000-0000-000000000000" --arg key_id "00000000-0000-0000-0000-000000000000" --rawfile private_key_pem ./your-downloaded-key.pem '{client_id:$client_id, key_id:$key_id, private_key_pem:$private_key_pem}' | aws secretsmanager create-secret --name abm/api-credentials --description "Apple Business API credentials" --secret-string file:///dev/stdin --query ARN --output text
 ```
 
-```bash
-aws secretsmanager create-secret \
-  --name abm/api-credentials \
-  --description "Apple Business API credentials" \
-  --secret-string file://abm-secret.json
-```
-
-Then delete the local files:
+Then delete the downloaded key:
 
 ```bash
-rm abm-secret.json ./your-downloaded-key.pem
+rm ./your-downloaded-key.pem
 ```
 
 The secret must contain exactly these keys: `client_id`, `key_id`, `private_key_pem` (the EC P-256 PEM from Apple).
 
-## 3. Build and deploy
+## 3. Create the bearer token secret
+
+The bearer token is what Nexthink sends to prove it may call the function. This generates a random 256-bit token, stores it in Secrets Manager, and copies it to your clipboard (macOS `pbcopy`; on Linux use `xclip -selection clipboard` or `wl-copy`) without printing it:
+
+```bash
+( TOKEN="$(openssl rand -hex 32)" && jq -n --arg token "$TOKEN" '{token:$token}' | aws secretsmanager create-secret --name abm/nexthink-bearer-token --description "Bearer token Nexthink uses to call the device lookup function" --secret-string file:///dev/stdin --query ARN --output text && printf %s "$TOKEN" | pbcopy && echo "Token copied to the clipboard" )
+```
+
+Paste it into Nexthink in [step 2 of the Nexthink setup](#2-create-the-nexthink-third-party-credentials-bearer-token), then clear your clipboard by copying something else. To copy it again later:
+
+```bash
+aws secretsmanager get-secret-value --secret-id abm/nexthink-bearer-token --query SecretString --output text | jq -r .token | pbcopy
+```
+
+The secret is JSON: `{"token": "..."}`, optionally with `"previous_token"` during rotation (see [Security](#security)). Tokens shorter than 32 characters are refused, and the function then fails closed with 502.
+
+## 4. Build and deploy
 
 Using Terraform instead? Follow [terraform/README.md](terraform/README.md) from here.
 
@@ -104,25 +113,35 @@ sam build
 sam deploy --guided
 ```
 
-When prompted, set `SecretId` to the secret **name** (for example `abm/api-credentials`, not the ARN). Leave `AbmScope` and `AbmApiBaseUrl` at their defaults for Apple Business. The stack output `FunctionUrl` is the endpoint.
+When prompted:
 
-`sam deploy --guided` writes `samconfig.toml`, which contains your stack settings; it is git-ignored and should never be committed.
+| Parameter | Value |
+| --- | --- |
+| `SecretId` | The Apple secret **name**, for example `abm/api-credentials` (not the ARN) |
+| `AuthMode` | `BearerToken` (default) |
+| `AuthTokenSecretId` | The token secret name, for example `abm/nexthink-bearer-token` |
+| `AbmScope`, `AbmApiBaseUrl` | Defaults for Apple Business |
 
-## 4. Call the Function URL
+The stack output `FunctionUrl` is the endpoint. `sam deploy --guided` writes `samconfig.toml`, which contains your stack settings; it is git-ignored and should never be committed.
 
-Requests must be SigV4-signed for service `lambda`. The caller needs `lambda:InvokeFunctionUrl` on the function. With [awscurl](https://github.com/okigan/awscurl):
+## 5. Call the Function URL
+
+The token is read from Secrets Manager inline, so it isn't stored in your shell history:
 
 ```bash
-awscurl --service lambda --region <region> \
-  "https://<url-id>.lambda-url.<region>.on.aws/?serial=C02XXXXXXXXX&include=assignedServer,appleCareCoverage"
+curl -s -H "Authorization: Bearer $(aws secretsmanager get-secret-value --secret-id abm/nexthink-bearer-token --query SecretString --output text | jq -r .token)" "https://<url-id>.lambda-url.<region>.on.aws/?serial=C02XXXXXXXXX&include=assignedServer,appleCareCoverage" | jq
 ```
 
-Direct invoke:
+Without the header you should get `401`:
 
 ```bash
-aws lambda invoke --function-name <function-name> \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"serial":"C02XXXXXXXXX"}' out.json
+curl -s -o /dev/null -w '%{http_code}\n' "https://<url-id>.lambda-url.<region>.on.aws/?serial=C02XXXXXXXXX"
+```
+
+Direct invoke (uses your AWS credentials, no token):
+
+```bash
+aws lambda invoke --function-name <function-name> --cli-binary-format raw-in-base64-out --payload '{"serial":"C02XXXXXXXXX"}' out.json
 ```
 
 ## Using it from Nexthink Workspaces
@@ -131,51 +150,38 @@ Nexthink reference: [API calls](https://docs.nexthink.com/configuring_nexthink/b
 
 ### Why a function sits in between
 
-Nexthink API calls authenticate with Basic, Bearer token or OAuth 2.0 credentials that use a **client secret**. Apple's API has no client secret: every token request must carry a JWT signed with your private key (ES256). Nexthink can't produce that signature, so this function does it. Nexthink calls the function, and the Apple key stays in AWS Secrets Manager.
+Nexthink API calls authenticate with Basic, Bearer token or OAuth 2.0 credentials that use a **client secret**. Apple's API has no client secret: every token request must carry a JWT signed with your private key (ES256). Nexthink can't produce that signature, so this function does it. Nexthink calls the function with a bearer token, and the Apple key stays in AWS Secrets Manager.
 
 ```
-Workspaces ──▶ Nexthink API call (GET) ──SigV4──▶ Function URL (AWS_IAM) ──▶ Lambda ──▶ Apple Business API
-                 credentials: AWS IAM role                                      │
-                                                                                └─▶ Secrets Manager (Apple key)
+Workspaces ──▶ Nexthink API call (GET) ──Bearer token──▶ Function URL ──▶ Lambda ──▶ Apple Business API
+                 credentials: Bearer token                                   │
+                                                                             └─▶ Secrets Manager (Apple key, token)
 ```
 
 ### 1. Deploy the function
 
-Deploy with SAM (above) or Terraform ([terraform/README.md](terraform/README.md)), keeping the Function URL on `AWS_IAM`. Note the Function URL and the function ARN.
+Complete steps 1–4 above (or the Terraform guide). Note the Function URL, and keep the token from step 3 ready to paste.
 
-### 2. Create the Nexthink Third-party credentials (AWS IAM)
+### 2. Create the Nexthink Third-party credentials (Bearer token)
 
-Nexthink reaches the function through **Third-party credentials**, which the **Nexthink admin** sets up following Nexthink's [Third-party credentials documentation](https://docs.nexthink.com/configuring_nexthink/bringing-data-into-your-nexthink-instance/integrating-nexthink-with-third-party-tools/outbound-connectors/connector-credentials). The credentials point at an IAM role that the **AWS admin** creates. Neither admin ever handles the Apple private key.
+Nexthink reaches the function through **Third-party credentials**, which the **Nexthink admin** sets up following Nexthink's [Third-party credentials documentation](https://docs.nexthink.com/configuring_nexthink/bringing-data-into-your-nexthink-instance/integrating-nexthink-with-third-party-tools/outbound-connectors/connector-credentials). The **AWS admin** provides the token. Neither admin ever handles the Apple private key.
 
-1. **Nexthink admin:** create Third-party credentials, give them a name, and choose **AWS IAM** as the **Protocol**.
-2. **Nexthink admin:** copy the **AWS External ID** that Nexthink generates and send it to the AWS admin. It isn't a password, but share it only with them.
-3. **AWS admin:** create a role that Nexthink can assume. Per Nexthink's AWS documentation, its name must start with `NexthinkConnector-`, and its trust policy names Nexthink's AWS account `884848470805` and requires your External ID. Save this as `nexthink-trust.json` (git-ignored):
+| Field | Value |
+| --- | --- |
+| Name | For example `ABM device lookup` |
+| Protocol | **HTTPS** |
+| URL | `https://<url-id>.lambda-url.<region>.on.aws` (your Function URL) |
+| Authorization type | **Bearer token** |
+| Header prefix | `Bearer` |
+| Token | The token from step 3 |
 
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Effect": "Allow",
-       "Principal": { "AWS": "arn:aws:iam::884848470805:root" },
-       "Action": "sts:AssumeRole",
-       "Condition": { "StringEquals": { "sts:ExternalId": "<external-id-from-nexthink>" } }
-     }]
-   }
-   ```
+Handing the token over:
 
-   ```bash
-   aws iam create-role --role-name NexthinkConnector-AbmLookup --assume-role-policy-document file://nexthink-trust.json --query Role.Arn --output text
-   ```
+- Ideally the person who creates the token secret pastes it into Nexthink directly from the clipboard.
+- Otherwise, share it through your organization's password manager. Never by email, chat, tickets or documents.
+- The token can only call this read-only lookup, but anyone who has it can query your devices, so treat it like a password.
 
-4. **AWS admin:** allow that role to call **only** this function. With Terraform, use `terraform output -raw invoke_policy_json`. Otherwise:
-
-   ```bash
-   aws iam put-role-policy --role-name NexthinkConnector-AbmLookup --policy-name InvokeAbmLookup --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunctionUrl","lambda:InvokeFunction"],"Resource":"<function-arn>"}]}'
-   ```
-
-5. **AWS admin:** send the role ARN to the Nexthink admin. **Nexthink admin:** paste it into **AWS Role ARN** and save the credentials.
-
-> **Confirm with Nexthink:** the AWS IAM protocol appears in the credentials form, but Nexthink's credentials documentation doesn't yet cover it, and its AWS documentation describes it only for the AWS AppStream connector. The function needs requests signed with SigV4 for service `lambda` in your function's region. If Nexthink's API calls don't sign that way, the test in step 4 returns 403. Ask Nexthink Support to confirm, and see [If AWS IAM credentials don't work](#if-aws-iam-credentials-dont-work).
+> Nexthink's credentials form also offers an **AWS IAM** protocol. It isn't fully functional for API calls yet, so it isn't used here. The function can switch to AWS SigV4 signing (`AuthMode=AwsIam`) once it is.
 
 ### 3. Create the API call
 
@@ -186,8 +192,8 @@ In Nexthink's API calls configuration, create a call from scratch:
 | Field | Value |
 | --- | --- |
 | Name | For example `Apple Business device lookup` |
-| Credentials | The AWS IAM credential from step 2 |
-| URL | `https://<url-id>.lambda-url.<region>.on.aws` (your Function URL) |
+| Credentials | The Bearer token credentials from step 2 |
+| URL | Filled in from the credentials |
 | Trigger | **Workspaces** |
 
 Triggering API calls from Workspaces isn't described in Nexthink's API calls documentation yet. Confirm the exact **Trigger** option in your instance.
@@ -228,14 +234,10 @@ The function accepts only **8–14 uppercase letters and digits**. Pass the seri
 | Test status | Meaning |
 | --- | --- |
 | 200 | Working |
+| 401 | The token is missing or wrong: check the credentials' **Authorization type**, **Header prefix** (`Bearer`) and **Token** |
 | 404 | The serial isn't in your Apple Business organization |
 | 400 | The serial isn't 8–14 uppercase letters and digits |
-| 403 | AWS refused the request: the role lacks invoke permission, or Nexthink isn't signing with SigV4 for `lambda` |
-| 502 | The function couldn't reach Apple. Check its CloudWatch log line's `upstreamStatus` |
-
-### If AWS IAM credentials don't work
-
-Don't switch the Function URL to `NONE` for production; that makes your device data public. Nexthink's documented **OAuth 2.0 - Client credentials** type is a supported alternative: put an Amazon API Gateway HTTP API with a JWT authorizer in front of the function, and have an Amazon Cognito app client issue tokens with a client ID and secret that you store in Nexthink. That piece isn't part of this repo yet.
+| 502 | The function couldn't read a secret or reach Apple. Check its CloudWatch log line |
 
 ## Configuration
 
@@ -244,23 +246,10 @@ Don't switch the Function URL to `NONE` for production; that makes your device d
 | `ABM_SECRET_ID` | `SecretId` | (required) |
 | `ABM_SCOPE` | `AbmScope` | `business.api` |
 | `ABM_API_BASE_URL` | `AbmApiBaseUrl` | `https://api-business.apple.com` |
-| — | `FunctionUrlAuthType` | `AWS_IAM` (`NONE` makes the URL public; testing only) |
+| `AUTH_TOKEN_SECRET_ID` | `AuthTokenSecretId` | (required in `BearerToken` mode) |
+| — | `AuthMode` | `BearerToken`; `AwsIam` requires SigV4-signed requests instead and turns the token check off |
 
-### Temporarily allowing unsigned requests (test stacks only)
-
-`FunctionUrlAuthType=NONE` makes the Function URL public: **anyone who has the URL can look up devices in your organization**. Use it only on a short-lived test stack, and switch back when you are done:
-
-```bash
-sam deploy --parameter-overrides SecretId=abm/api-credentials FunctionUrlAuthType=NONE
-```
-
-```bash
-curl -s "https://<url-id>.lambda-url.<region>.on.aws/?serial=C02XXXXXXXXX" | jq
-```
-
-```bash
-sam deploy --parameter-overrides SecretId=abm/api-credentials FunctionUrlAuthType=AWS_IAM
-```
+The SAM template refuses to deploy `BearerToken` mode without `AuthTokenSecretId`, so the Function URL is never reachable without a token check.
 
 ## Development
 
@@ -276,16 +265,33 @@ npm test
 npm run lint
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint, tests, and a [gitleaks](https://github.com/gitleaks/gitleaks) scan of the full git history. To run gitleaks before every commit, install the optional hook in `.pre-commit-config.yaml` with `pre-commit install`.
+CI (`.github/workflows/ci.yml`) runs lint, tests, Terraform checks, and a [gitleaks](https://github.com/gitleaks/gitleaks) scan of the full git history. To run gitleaks before every commit, install the optional hook in `.pre-commit-config.yaml` with `pre-commit install`.
 
 ## Security
 
-- **The private key lives only in AWS Secrets Manager.** It is never in code, config, environment variables, tests, or git history. Tests generate a throwaway EC key in memory at run time.
-- **Least-privilege IAM:** the function may only call `secretsmanager:GetSecretValue` on the one secret named by `SecretId`; the ARN is built from the deploying account's partition, region and account ID, so none are hard-coded. If the secret uses a customer-managed KMS key, also grant `kms:Decrypt` on that key.
-- **Authenticated endpoint:** the Function URL uses `AWS_IAM` auth by default; grant `lambda:InvokeFunctionUrl` only to the principals that need it. Never deploy with `FunctionUrlAuthType=NONE` against production data.
-- **Nothing sensitive leaves the function:** access tokens, the client assertion and secret material are never logged or returned. Upstream errors are returned as a generic 502.
-- **Rotate the key** by creating a new key in Apple Business (Settings > API), updating the secret (`aws secretsmanager put-secret-value --secret-id abm/api-credentials --secret-string file://abm-secret.json`), and revoking the old key in Apple Business. Running containers pick up the new secret on their next cold start; to force it immediately, update the function configuration or redeploy.
-- **Never commit `samconfig.toml`**, `.pem`/`.key` files, `.env*` files, or the secret JSON. All are in `.gitignore`, and gitleaks runs in CI.
+- **The Apple private key and the bearer token live only in AWS Secrets Manager.** Neither is ever in code, config, environment variables, tests, Terraform state or git history. Tests generate a throwaway EC key and dummy tokens at run time.
+- **Least-privilege IAM:** the function may only call `secretsmanager:GetSecretValue` on its two secrets; their ARNs are built from the deploying account's partition, region and account ID, so none are hard-coded. If the secrets use a customer-managed KMS key, also grant `kms:Decrypt` on that key.
+- **The token check runs first.** The Function URL is reachable on the internet, but any request without a valid token gets 401 before input is validated, the Apple key is read or Apple is called. Tokens are compared in constant time and are never logged or returned.
+- **Cap abuse:** rejected requests still start the function briefly. To limit cost and protect your Apple API rate limit, reserve a small concurrency (`aws lambda put-function-concurrency --function-name <function-name> --reserved-concurrent-executions 5`; not possible on accounts with a low concurrency quota), and alarm on log lines containing `"auth":"rejected"`.
+- **Nothing sensitive leaves the function:** Apple access tokens, the client assertion and secret material are never logged or returned. Upstream errors are returned as a generic 502.
+- **Rotate the bearer token** without downtime, and right away if it may have leaked:
+  1. Store a new token and keep the old one as `previous_token` (the new token is copied to your clipboard):
+
+     ```bash
+     ( NEW="$(openssl rand -hex 32)" && aws secretsmanager get-secret-value --secret-id abm/nexthink-bearer-token --query SecretString --output text | jq --arg t "$NEW" '{token:$t, previous_token:.token}' | aws secretsmanager put-secret-value --secret-id abm/nexthink-bearer-token --secret-string file:///dev/stdin --query VersionId --output text && printf %s "$NEW" | pbcopy && echo "New token copied to the clipboard" )
+     ```
+
+  2. Wait 5 minutes; the function re-reads the token secret at least that often.
+  3. Paste the new token into the Nexthink credentials and test the API call.
+  4. Remove the old token:
+
+     ```bash
+     aws secretsmanager get-secret-value --secret-id abm/nexthink-bearer-token --query SecretString --output text | jq '{token}' | aws secretsmanager put-secret-value --secret-id abm/nexthink-bearer-token --secret-string file:///dev/stdin --query VersionId --output text
+     ```
+
+  For a suspected leak, skip keeping `previous_token`: store only the new token, then update Nexthink.
+- **Rotate the Apple key** by creating a new key in Apple Business (Settings > API), updating the Apple secret with `put-secret-value` (same pipe as step 2), and revoking the old key in Apple Business. Running containers keep the Apple key until their next cold start; to force it immediately, update the function configuration or redeploy.
+- **Never commit `samconfig.toml`**, `.pem`/`.key` files, `.env*` files, or secret JSON. All are in `.gitignore`, and gitleaks runs in CI.
 
 ## Apple documentation
 

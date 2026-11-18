@@ -1,11 +1,13 @@
 # Copy to terraform.tfvars (git-ignored) and fill in. Never put the Apple
-# private key, client ID or key ID here: they belong only in Secrets Manager.
+# private key, client ID, key ID or the bearer token here: they belong only in
+# Secrets Manager.
 
-region      = "us-east-1"
-secret_name = "abm/api-credentials"
+region                 = "us-east-1"
+secret_name            = "abm/api-credentials"
+auth_token_secret_name = "abm/nexthink-bearer-token"
 
-# Recommended: the customer-managed KMS key that encrypts the secret.
+# Recommended: the customer-managed KMS key that encrypts the secrets.
 # kms_key_arn = "arn:aws:kms:<region>:<account-id>:key/<key-id>"
 
-# Other accounts or roles that may call the function (optional).
+# Other accounts or roles that may invoke the function directly (optional).
 # invoker_principals = ["arn:aws:iam::<account-id>:role/<caller-role>"]

@@ -1,9 +1,14 @@
-// Loads the Apple Business API credentials from AWS Secrets Manager.
-// The secret is cached for the lifetime of the Lambda container.
+// Loads secrets from AWS Secrets Manager:
+// - the Apple Business API credentials, cached for the container lifetime;
+// - the optional caller bearer token(s), re-read every few minutes so a
+//   rotated token takes effect without a redeploy.
 
 const REQUIRED_KEYS = ['client_id', 'key_id', 'private_key_pem'];
+const MIN_TOKEN_LENGTH = 32;
+const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 
-let cached;
+let cachedAbm;
+let cachedTokens; // { tokens, expiresAt }
 let loader = defaultLoader;
 
 async function defaultLoader(secretId) {
@@ -17,39 +22,61 @@ async function defaultLoader(secretId) {
   return res.SecretString;
 }
 
+async function loadJson(secretId) {
+  const raw = await loader(secretId);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error('Secret is not valid JSON');
+  }
+}
+
 export async function getAbmSecret() {
-  if (cached) return cached;
+  if (cachedAbm) return cachedAbm;
 
   const secretId = process.env.ABM_SECRET_ID;
   if (!secretId) throw new Error('ABM_SECRET_ID is not set');
 
-  const raw = await loader(secretId);
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error('Secret is not valid JSON');
-  }
+  const parsed = await loadJson(secretId);
   for (const key of REQUIRED_KEYS) {
     if (typeof parsed?.[key] !== 'string' || parsed[key] === '') {
       throw new Error(`Secret is missing required key: ${key}`);
     }
   }
 
-  cached = {
+  cachedAbm = {
     clientId: parsed.client_id,
     keyId: parsed.key_id,
     privateKeyPem: parsed.private_key_pem,
   };
-  return cached;
+  return cachedAbm;
+}
+
+// Returns the accepted bearer tokens, or null when AUTH_TOKEN_SECRET_ID is not
+// set (token checking disabled). The secret is JSON: {"token": "...",
+// "previous_token": "..."}; previous_token is optional and eases rotation.
+export async function getAuthTokens() {
+  const secretId = process.env.AUTH_TOKEN_SECRET_ID;
+  if (!secretId) return null;
+  if (cachedTokens && Date.now() < cachedTokens.expiresAt) return cachedTokens.tokens;
+
+  const parsed = await loadJson(secretId);
+  const tokens = [parsed?.token, parsed?.previous_token].filter((t) => t !== undefined && t !== null && t !== '');
+  if (typeof parsed?.token !== 'string' || !tokens.every((t) => typeof t === 'string' && t.length >= MIN_TOKEN_LENGTH)) {
+    throw new Error(`Token secret must hold "token" (and optionally "previous_token") of at least ${MIN_TOKEN_LENGTH} characters`);
+  }
+
+  cachedTokens = { tokens, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS };
+  return tokens;
 }
 
 // Test hooks.
 export function _setSecretLoader(fn) {
   loader = fn ?? defaultLoader;
-  cached = undefined;
+  _resetSecretCache();
 }
 
 export function _resetSecretCache() {
-  cached = undefined;
+  cachedAbm = undefined;
+  cachedTokens = undefined;
 }

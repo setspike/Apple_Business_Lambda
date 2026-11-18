@@ -1,18 +1,25 @@
-# Apple Business device lookup: Lambda + IAM-authenticated Function URL.
+# Apple Business device lookup: Lambda + Function URL.
 #
-# This module never reads the secret's VALUE. It only looks up the secret's
-# metadata (its ARN), so the Apple private key never enters Terraform state.
+# auth_mode = "bearer_token" (default): the URL needs no AWS signing, and the
+# function rejects any request without a valid bearer token (401).
+# auth_mode = "aws_iam": the URL requires SigV4-signed requests.
+#
+# This module never reads a secret's VALUE. It only looks up secret metadata
+# (ARNs), so neither the Apple private key nor the bearer token enters
+# Terraform state.
 
 locals {
-  use_vpc = length(var.vpc_subnet_ids) > 0
+  use_vpc      = length(var.vpc_subnet_ids) > 0
+  bearer_token = var.auth_mode == "bearer_token"
+  iam_url      = var.enable_function_url && !local.bearer_token
 
   # Each invoker gets one permission per action it needs.
   invoker_grants = merge(
-    var.enable_function_url ? {
+    local.iam_url ? {
       for p in var.invoker_principals : "url-${p}" => { principal = p, action = "lambda:InvokeFunctionUrl", via_url = true }
     } : {},
     {
-      for p in var.invoker_principals : "invoke-${p}" => { principal = p, action = "lambda:InvokeFunction", via_url = var.enable_function_url }
+      for p in var.invoker_principals : "invoke-${p}" => { principal = p, action = "lambda:InvokeFunction", via_url = local.iam_url }
     },
   )
 }
@@ -24,6 +31,12 @@ data "aws_region" "current" {}
 # that would copy the private key into Terraform state in plain text.
 data "aws_secretsmanager_secret" "abm" {
   name = var.secret_name
+}
+
+data "aws_secretsmanager_secret" "auth_token" {
+  # Skipped when the name is missing so the clearer precondition below reports it.
+  count = local.bearer_token && var.auth_token_secret_name != null ? 1 : 0
+  name  = var.auth_token_secret_name
 }
 
 data "archive_file" "function" {
@@ -66,9 +79,9 @@ data "aws_iam_policy_document" "function" {
   }
 
   statement {
-    sid       = "ReadAbmSecretOnly"
+    sid       = "ReadOwnSecretsOnly"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [data.aws_secretsmanager_secret.abm.arn]
+    resources = concat([data.aws_secretsmanager_secret.abm.arn], data.aws_secretsmanager_secret.auth_token[*].arn)
   }
 
   dynamic "statement" {
@@ -119,6 +132,8 @@ resource "aws_lambda_function" "function" {
       ABM_SECRET_ID    = var.secret_name
       ABM_SCOPE        = var.abm_scope
       ABM_API_BASE_URL = var.api_base_url
+      # Empty disables the token check (aws_iam mode).
+      AUTH_TOKEN_SECRET_ID = local.bearer_token ? var.auth_token_secret_name : ""
     }
   }
 
@@ -142,6 +157,14 @@ resource "aws_lambda_function" "function" {
       condition     = !local.use_vpc || length(var.vpc_security_group_ids) > 0
       error_message = "vpc_security_group_ids is required when vpc_subnet_ids is set."
     }
+    precondition {
+      condition     = !local.bearer_token || var.auth_token_secret_name != null
+      error_message = "auth_token_secret_name is required when auth_mode is bearer_token."
+    }
+    precondition {
+      condition     = !local.bearer_token || var.enable_function_url
+      error_message = "auth_mode bearer_token needs enable_function_url = true; use aws_iam for direct invokes only."
+    }
   }
 
   depends_on = [
@@ -151,9 +174,30 @@ resource "aws_lambda_function" "function" {
 }
 
 resource "aws_lambda_function_url" "function" {
-  count              = var.enable_function_url ? 1 : 0
-  function_name      = aws_lambda_function.function.function_name
-  authorization_type = "AWS_IAM" # deliberately not configurable
+  count         = var.enable_function_url ? 1 : 0
+  function_name = aws_lambda_function.function.function_name
+  # NONE only together with the function's own bearer-token check.
+  authorization_type = local.bearer_token ? "NONE" : "AWS_IAM"
+}
+
+# A Function URL without AWS signing needs both of these permissions. Requests
+# still need a valid bearer token, which the function checks.
+resource "aws_lambda_permission" "url_public" {
+  count                  = local.bearer_token && var.enable_function_url ? 1 : 0
+  statement_id           = "FunctionUrlNoAwsSigning"
+  function_name          = aws_lambda_function.function.function_name
+  action                 = "lambda:InvokeFunctionUrl"
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "url_public_invoke" {
+  count                    = local.bearer_token && var.enable_function_url ? 1 : 0
+  statement_id             = "FunctionUrlNoAwsSigningInvoke"
+  function_name            = aws_lambda_function.function.function_name
+  action                   = "lambda:InvokeFunction"
+  principal                = "*"
+  invoked_via_function_url = true
 }
 
 # --- Who may call it ----------------------------------------------------------
@@ -173,7 +217,7 @@ resource "aws_lambda_permission" "invoker" {
 # can attach to be allowed to call the function. Exposed as an output.
 data "aws_iam_policy_document" "invoke" {
   dynamic "statement" {
-    for_each = var.enable_function_url ? [1] : []
+    for_each = local.iam_url ? [1] : []
     content {
       sid       = "InvokeAbmLookupUrl"
       actions   = ["lambda:InvokeFunctionUrl"]

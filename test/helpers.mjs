@@ -42,12 +42,21 @@ export function mockFetch(t, routes) {
   return calls;
 }
 
+const ABM_SECRET_JSON = () =>
+  JSON.stringify({ client_id: CLIENT_ID, key_id: KEY_ID, private_key_pem: PRIVATE_KEY_PEM });
+
 export function setup() {
   process.env.ABM_SECRET_ID = 'abm/test-secret';
   delete process.env.ABM_SCOPE;
   delete process.env.ABM_API_BASE_URL;
-  _setSecretLoader(async () =>
-    JSON.stringify({ client_id: CLIENT_ID, key_id: KEY_ID, private_key_pem: PRIVATE_KEY_PEM }),
-  );
+  delete process.env.AUTH_TOKEN_SECRET_ID;
+  _setSecretLoader(async () => ABM_SECRET_JSON());
   clearTokenCache();
+}
+
+// Enables bearer-token checking. `tokenSecret` is a function returning the
+// token secret's JSON string (or throwing), so tests can change it over time.
+export function enableTokenAuth(tokenSecret) {
+  process.env.AUTH_TOKEN_SECRET_ID = 'abm/test-token';
+  _setSecretLoader(async (id) => (id === 'abm/test-token' ? tokenSecret() : ABM_SECRET_JSON()));
 }
