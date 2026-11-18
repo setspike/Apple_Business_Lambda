@@ -45,7 +45,7 @@ There is one more secret, which you create yourself:
 
 1. It is generated randomly (256 bits) and stored in its own Secrets Manager secret.
 2. It leaves AWS once: pasted directly into Nexthink's credentials, or shared through your password manager. Never by email, chat, tickets or documents.
-3. It is rotated on a schedule, and immediately if it may have leaked (step 11).
+3. It **never expires or refreshes on its own**, so it is rotated by hand every 90 days, when someone who had it leaves, and immediately if it may have leaked (step 11).
 
 ---
 
@@ -343,7 +343,11 @@ curl -s -o /dev/null -w '%{http_code}\n' "$(terraform output -raw function_url)?
 
 ### Rotate the bearer token
 
-Do this on a schedule (for example every 90 days) and whenever someone who had the token leaves. The old token keeps working until Nexthink is updated, so there's no downtime.
+Do this every 90 days and whenever someone who had the token leaves. The token never expires on its own, and it can't rotate automatically because Nexthink must receive the new value, so put the date on your team's calendar. The old token keeps working until Nexthink is updated, so there's no downtime. To see when the token was last changed:
+
+```bash
+aws secretsmanager describe-secret --secret-id abm/nexthink-bearer-token --query '{Created:CreatedDate,LastChanged:LastChangedDate}'
+```
 
 1. Store a new token, keeping the old one as `previous_token`. The new token is copied to your clipboard:
 

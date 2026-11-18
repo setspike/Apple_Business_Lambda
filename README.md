@@ -99,7 +99,9 @@ Paste it into Nexthink in [step 2 of the Nexthink setup](#2-create-the-nexthink-
 aws secretsmanager get-secret-value --secret-id abm/nexthink-bearer-token --query SecretString --output text | jq -r .token | pbcopy
 ```
 
-The secret is JSON: `{"token": "..."}`, optionally with `"previous_token"` during rotation (see [Security](#security)). Tokens shorter than 32 characters are refused, and the function then fails closed with 502.
+**The token doesn't expire and doesn't refresh itself.** It stays valid until you replace it, and it can't rotate automatically, because the new value must also be pasted into Nexthink. Rotate it every 90 days; see [Security](#security).
+
+The secret is JSON: `{"token": "..."}`, optionally with `"previous_token"` during rotation. Tokens shorter than 32 characters are refused, and the function then fails closed with 502.
 
 ## 4. Build and deploy
 
@@ -274,7 +276,13 @@ CI (`.github/workflows/ci.yml`) runs lint, tests, Terraform checks, and a [gitle
 - **The token check runs first.** The Function URL is reachable on the internet, but any request without a valid token gets 401 before input is validated, the Apple key is read or Apple is called. Tokens are compared in constant time and are never logged or returned.
 - **Cap abuse:** rejected requests still start the function briefly. To limit cost and protect your Apple API rate limit, reserve a small concurrency (`aws lambda put-function-concurrency --function-name <function-name> --reserved-concurrent-executions 5`; not possible on accounts with a low concurrency quota), and alarm on log lines containing `"auth":"rejected"`.
 - **Nothing sensitive leaves the function:** Apple access tokens, the client assertion and secret material are never logged or returned. Upstream errors are returned as a generic 502.
-- **Rotate the bearer token** without downtime, and right away if it may have leaked:
+- **Rotate the bearer token every 90 days**, whenever someone who had access to it leaves, and right away if it may have leaked. Unlike Apple's access tokens (1 hour), which the function renews by itself, the bearer token never expires on its own, so rotation is a manual task: put it on your team's calendar. To see when it was last changed:
+
+  ```bash
+  aws secretsmanager describe-secret --secret-id abm/nexthink-bearer-token --query '{Created:CreatedDate,LastChanged:LastChangedDate}'
+  ```
+
+  Rotation causes no downtime:
   1. Store a new token and keep the old one as `previous_token` (the new token is copied to your clipboard):
 
      ```bash
