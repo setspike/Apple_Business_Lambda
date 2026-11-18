@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. Never put the Apple
+# private key, client ID or key ID here: they belong only in Secrets Manager.
+
+region      = "us-east-1"
+secret_name = "abm/api-credentials"
+
+# Recommended: the customer-managed KMS key that encrypts the secret.
+# kms_key_arn = "arn:aws:kms:<region>:<account-id>:key/<key-id>"
+
+# Other accounts or roles that may call the function (optional).
+# invoker_principals = ["arn:aws:iam::<account-id>:role/<caller-role>"]

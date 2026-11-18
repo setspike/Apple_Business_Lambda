@@ -6,3 +6,18 @@ samconfig.toml
 .env*
 coverage/
 abm-secret.json
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+tfplan
+crash.log
+terraform/.build/
+response.json
+secret-policy.json
+nexthink-trust.json

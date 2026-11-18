@@ -20,6 +20,16 @@ Parameters:
     Description: API base URL. Use https://api-school.apple.com for Apple School Manager.
     Default: https://api-business.apple.com
     AllowedPattern: '^https://[A-Za-z0-9.-]+$'
+  FunctionUrlAuthType:
+    Type: String
+    Description: >-
+      AWS_IAM requires SigV4-signed requests. NONE makes the URL public (anyone with
+      the URL can query your organization's devices); use it only for short-lived testing.
+    Default: AWS_IAM
+    AllowedValues: [AWS_IAM, NONE]
+
+Conditions:
+  PublicUrl: !Equals [!Ref FunctionUrlAuthType, NONE]
 
 Resources:
   DeviceLookupFunction:
@@ -37,13 +47,32 @@ Resources:
           ABM_SCOPE: !Ref AbmScope
           ABM_API_BASE_URL: !Ref AbmApiBaseUrl
       FunctionUrlConfig:
-        AuthType: AWS_IAM
+        AuthType: !Ref FunctionUrlAuthType
       Policies:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               # Secrets Manager appends a 6-character suffix to secret ARNs.
               Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretId}-??????'
+
+  # A public (NONE) Function URL needs both of these resource-based permissions.
+  PublicUrlInvokeUrlPermission:
+    Type: AWS::Lambda::Permission
+    Condition: PublicUrl
+    Properties:
+      FunctionName: !Ref DeviceLookupFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  PublicUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: PublicUrl
+    Properties:
+      FunctionName: !Ref DeviceLookupFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
 
   DeviceLookupLogGroup:
     Type: AWS::Logs::LogGroup

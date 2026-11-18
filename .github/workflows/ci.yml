@@ -34,3 +34,14 @@ jobs:
             | tar -xz gitleaks
       - name: Scan for secrets
         run: ./gitleaks git --redact --verbose .
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.x
+      - run: terraform fmt -check -recursive terraform
+      - run: terraform -chdir=terraform/examples/basic init -backend=false -input=false
+      - run: terraform -chdir=terraform/examples/basic validate

@@ -1,0 +1,15 @@
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+      # 6.28.0 added `invoked_via_function_url` on aws_lambda_permission.
+      version = ">= 6.28.0, < 7.0.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = ">= 2.4.0"
+    }
+  }
+}
